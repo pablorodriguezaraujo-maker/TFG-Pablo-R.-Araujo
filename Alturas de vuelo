@@ -1,0 +1,614 @@
+"""Optimiza alturas de waypoints para rutas médicas entre ciudades.
+
+El script calcula perfiles AGL/AMSL por ciudad usando datos de terreno y
+edificaciones, con una rampa suave de subida y bajada para proteger la carga.
+"""
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import rasterio
+except ImportError:
+    rasterio = None
+
+BASE_DIR = Path(__file__).resolve().parent
+
+INPUT_FILE = BASE_DIR / "waypoints_ciudades.txt"
+OUTPUT_FILE = BASE_DIR / "waypoints_ciudades_con_alturas.txt"
+MIN_BUILDING_CLEARANCE_M = 25.0
+MAX_DRONE_AGL_M = 120.0  # Límite legal máximo sobre el terreno (m).
+MIN_CRUISE_AGL_M = 100.0  # Altitud mínima de crucero solicitada.
+CLIMB_FRAC = 0.40  # Fracción de la ruta dedicada a la subida.
+DESCENT_FRAC = 0.40  # Fracción de la ruta dedicada a la bajada.
+
+CITY_ELEVATION_RASTER = {
+    "Coruña": BASE_DIR / "elevaciones" / "elevacion coruna.tif",
+    "Santiago": BASE_DIR / "elevaciones" / "elevacion santiago.tif",
+    "Vigo": BASE_DIR / "elevaciones" / "elevacion vigo.tif",
+}
+BUILDING_HEIGHT_RASTER = BASE_DIR / "edificios" / "alturas_edificios_2018.tif"
+
+# Coordenadas reales de inicio y fin de cada ruta.
+# El perfil se calcula sobre la ruta completa para repartir suavemente
+# la subida y la bajada desde el despegue/aterrizaje reales.
+CITY_ROUTE_ENDPOINTS = {
+    "Coruña": {"start": (43.3044, -8.3775904), "end": (43.3446688, -8.3889104)},
+    "Santiago": {"start": (42.89285, -8.42089), "end": (42.86841, -8.56752)},
+    "Vigo": {"start": (42.22216, -8.63212), "end": (42.1879648, -8.7139768)},
+}
+
+
+@dataclass
+class Waypoint:
+    idx: int
+    lat: float
+    lon: float
+
+
+@dataclass
+class CityParams:
+    h_start_agl: float
+    h_end_agl: float
+    cruise_alt_agl: float       # altitud de crucero AGL (entre 100 y 120 m)
+    h_end_is_msl: bool = False  # si True, h_end_agl se interpreta como AMSL
+
+
+def _make_anchor_wp(lat: float, lon: float) -> "Waypoint":
+    """Crea un waypoint auxiliar sin indice para los extremos reales de la ruta."""
+    return Waypoint(idx=-1, lat=lat, lon=lon)
+
+
+def parse_decimal(value: str) -> float:
+    """Convierte número en texto con coma o punto decimal a float."""
+    return float(value.strip().replace(",", "."))
+
+
+def format_decimal(value: float, ndigits: int = 8) -> str:
+    """Formatea float con coma decimal para salida textual."""
+    return f"{value:.{ndigits}f}".replace(".", ",")
+
+
+def parse_waypoints_file(path: Path) -> dict[str, list[Waypoint]]:
+    city_header_re = re.compile(r"^([A-Za-zÁÉÍÓÚáéíóúÑñüÜ]+)\s*\(")
+    routes: dict[str, list[Waypoint]] = {}
+    current_city = None
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        header_match = city_header_re.match(line)
+        if header_match:
+            current_city = header_match.group(1)
+            routes[current_city] = []
+            continue
+
+        if current_city is None or ";" not in line:
+            continue
+
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+
+        routes[current_city].append(
+            Waypoint(
+                idx=int(parts[0]),
+                lat=parse_decimal(parts[1]),
+                lon=parse_decimal(parts[2]),
+            )
+        )
+
+    return routes
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371000.0
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+
+    a = (
+        np.sin(dphi / 2.0) ** 2
+        + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
+    )
+    return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
+def cumulative_distances_m(waypoints: list[Waypoint]) -> np.ndarray:
+    d = [0.0]
+    for i in range(1, len(waypoints)):
+        p1, p2 = waypoints[i - 1], waypoints[i]
+        d.append(d[-1] + haversine_m(p1.lat, p1.lon, p2.lat, p2.lon))
+    return np.array(d, dtype=float)
+
+
+N_DENSE = 2000  # Malla densa para evaluar restricciones y suavidad.
+
+
+def _scurve(s_norm: np.ndarray) -> np.ndarray:
+    """Curva-S coseno con transición suave en los extremos.
+
+    Entrada: s_norm en [0, 1].
+    Salida:  valores en [0, 1].
+    f(s) = 0.5 * (1 - cos(pi * s))
+    f'(0) = f'(1) = 0  -> velocidad vertical nula al inicio/fin de fase.
+    f''(0) = f''(1) = 0 -> aceleración vertical nula (sin jerk brusco).
+    """
+    return 0.5 * (1.0 - np.cos(np.pi * np.clip(s_norm, 0.0, 1.0)))
+
+
+def build_altitude_profile(
+    waypoints: list["Waypoint"],
+    h_start: float,
+    h_cruise: float,
+    h_end: float,
+    start_anchor: tuple[float, float] | None = None,
+    end_anchor: tuple[float, float] | None = None,
+    climb_frac: float = CLIMB_FRAC,
+    descent_frac: float = DESCENT_FRAC,
+) -> np.ndarray:
+    """Perfil de alturas AGL optimizado para transporte de órganos.
+
+    Usa curvas-S coseno (perfil de minimo jerk vertical) para las fases de
+    subida y bajada. Esto garantiza:
+      - Velocidad vertical = 0 al inicio y fin de cada transicion.
+      - Aceleracion vertical = 0 al inicio y fin de cada transicion.
+      - Sin cambios bruscos de actitud que afecten la carga.
+
+    Fases:
+      [0, climb_frac*total]                  : subida curva-S de h_start a h_cruise
+      [climb_frac*total, (1-descent_frac)*total] : crucero a h_cruise
+      [(1-descent_frac)*total, total]        : bajada curva-S de h_cruise a h_end
+    """
+    n = len(waypoints)
+    if n == 0:
+        return np.array([], dtype=float)
+    if n == 1:
+        return np.array([(h_start + h_end) / 2.0], dtype=float)
+
+    use_anchors = start_anchor is not None and end_anchor is not None
+    if use_anchors:
+        all_wps = [_make_anchor_wp(*start_anchor)] + waypoints + [_make_anchor_wp(*end_anchor)]
+    else:
+        all_wps = waypoints
+
+    s_all = cumulative_distances_m(all_wps)
+    total = s_all[-1]
+
+    if total <= 1e-9:
+        return np.full(n, (h_start + h_end) / 2.0)
+
+    d_climb_end = total * climb_frac
+    d_descent_start = total * (1.0 - descent_frac)
+
+    # Malla densa para evaluar el perfil con precisión.
+    s_dense = np.linspace(0.0, total, N_DENSE)
+    profile_dense = np.empty_like(s_dense)
+
+    # Fase 1: subida curva-S
+    mask_climb = s_dense <= d_climb_end
+    s_norm_climb = s_dense[mask_climb] / d_climb_end if d_climb_end > 0 else np.ones(mask_climb.sum())
+    profile_dense[mask_climb] = h_start + (h_cruise - h_start) * _scurve(s_norm_climb)
+
+    # Fase 2: crucero plano
+    mask_cruise = (s_dense > d_climb_end) & (s_dense <= d_descent_start)
+    profile_dense[mask_cruise] = h_cruise
+
+    # Fase 3: bajada curva-S
+    mask_descent = s_dense > d_descent_start
+    d_descent_len = total - d_descent_start
+    s_norm_descent = (
+        (s_dense[mask_descent] - d_descent_start) / d_descent_len
+        if d_descent_len > 0
+        else np.ones(mask_descent.sum())
+    )
+    profile_dense[mask_descent] = h_cruise + (h_end - h_cruise) * _scurve(s_norm_descent)
+
+    # Fijar extremos exactos
+    profile_dense[0] = h_start
+    profile_dense[-1] = h_end
+
+    # Muestrear en las posiciones reales de los waypoints
+    s_wps = s_all[1:-1] if use_anchors else s_all
+    heights = np.interp(s_wps, s_dense, profile_dense)
+
+    # Métricas de calidad para validar suavidad del perfil.
+    if N_DENSE > 2:
+        ds = total / (N_DENSE - 1)
+        # Segunda derivada: aceleración vertical aproximada.
+        d2h = np.diff(np.diff(profile_dense)) / (ds ** 2)
+        # Tercera derivada: jerk aproximado.
+        d3h = np.diff(d2h) / ds
+        print(
+            f"    Curvatura max (accel vertical): {np.max(np.abs(d2h)):.4f} m/m²  |  "
+            f"Jerk max: {np.max(np.abs(d3h)):.6f} m/m³"
+        )
+
+    return heights
+
+
+def sample_terrain_m(waypoints: list[Waypoint], raster_path: Path) -> np.ndarray:
+    if rasterio is None:
+        raise RuntimeError(
+            "Falta rasterio. Instala con: pip install rasterio"
+        )
+    if not raster_path.is_file():
+        raise FileNotFoundError(f"No se encontro raster de elevacion: {raster_path}")
+
+    terrain = []
+    with rasterio.open(raster_path) as ds:
+        nodata = ds.nodata
+        samples = list(ds.sample([(wp.lon, wp.lat) for wp in waypoints]))
+
+    for val in samples:
+        z = float(val[0]) if len(val) else np.nan
+        if nodata is not None and np.isclose(z, nodata):
+            z = np.nan
+        terrain.append(z)
+
+    if np.any(np.isnan(terrain)):
+        raise ValueError(
+            "Hay waypoints fuera de cobertura o con NODATA en el raster de elevacion"
+        )
+
+    return np.array(terrain, dtype=float)
+
+
+def sample_max_building_height_m(
+    waypoints: list[Waypoint],
+    raster_path: Path,
+) -> float:
+    """Devuelve la altura máxima de edificios en el tramo de crucero.
+
+    El raster GHS-BUILT-H usa proyeccion Mollweide (EPSG:54009), por lo que
+    transformo las coordenadas WGS84 antes de muestrear.
+    Ignoro nodata y valores <= 0.
+    """
+    if rasterio is None:
+        raise RuntimeError("Falta rasterio. Instala con: pip install rasterio")
+    if not raster_path.is_file():
+        raise FileNotFoundError(f"No se encontro raster de edificios: {raster_path}")
+
+    from rasterio.warp import transform as rio_transform
+
+    # Waypoints de crucero (excluye primero y último).
+    cruise_wps = waypoints[1:-1] if len(waypoints) > 2 else waypoints
+
+    with rasterio.open(raster_path) as ds:
+        nodata = ds.nodata
+        raster_crs = ds.crs
+
+        lons = [wp.lon for wp in cruise_wps]
+        lats = [wp.lat for wp in cruise_wps]
+
+        if raster_crs is not None and str(raster_crs) != "EPSG:4326":
+            xs, ys = rio_transform("EPSG:4326", raster_crs, lons, lats)
+        else:
+            xs, ys = lons, lats
+
+        coords = list(zip(xs, ys))
+        samples = list(ds.sample(coords))
+
+    heights = []
+    for val in samples:
+        z = float(val[0]) if len(val) else np.nan
+        if nodata is not None and np.isclose(z, float(nodata)):
+            z = np.nan
+        if not np.isnan(z) and z > 0:
+            heights.append(z)
+
+    if not heights:
+        print(
+            "  Aviso: no se encontraron alturas de edificios validas en el raster "
+            "para los waypoints de crucero. Se asume 0 m."
+        )
+        return 0.0
+
+    return float(np.max(heights))
+
+
+def enforce_minimum_cruise_agl(
+    heights_agl: np.ndarray,
+    min_cruise_agl: float,
+) -> np.ndarray:
+    """Aplica altura mínima de seguridad a todos los waypoints.
+
+    Los puntos reales de despegue y aterrizaje son los anclajes (no estan
+    en este array), por lo que el margen se aplica a todos los elementos.
+    """
+    return np.maximum(heights_agl, min_cruise_agl)
+
+
+def ask_float(prompt: str) -> float:
+    while True:
+        raw = input(prompt).strip().replace(",", ".")
+        try:
+            return float(raw)
+        except ValueError:
+            print("Valor no valido. Escribe un numero, por ejemplo 120 o 120,5")
+
+
+def _fmt_row(
+    tipo: str,
+    idx: str,
+    lat: float,
+    lon: float,
+    terreno: float,
+    agl: float,
+    msl: float,
+    nota: str,
+) -> str:
+    return (
+        f"{tipo:<12} {idx:<6} "
+        f"lat={format_decimal(lat, 8)}  lon={format_decimal(lon, 8)}  "
+        f"terreno={format_decimal(terreno, 1)} m  "
+        f"AGL={format_decimal(agl, 1)} m  "
+        f"AMSL={format_decimal(msl, 1)} m"
+        + (f"  [{nota}]" if nota else "")
+    )
+
+
+def build_output(
+    routes: dict[str, list[Waypoint]],
+    city_params: dict[str, CityParams],
+) -> str:
+    sep = "=" * 80
+    out_lines = [
+        sep,
+        "  PERFIL DE ALTURAS OPTIMIZADO PARA TRANSPORTE DE ORGANOS",
+        f"  Limite legal: {MAX_DRONE_AGL_M:.0f} m AGL  |  "
+        f"Margen seguridad edificios: {MIN_BUILDING_CLEARANCE_M:.0f} m  |  "
+        f"Subida/bajada: {int(CLIMB_FRAC*100)}% de la ruta",
+        sep,
+        "",
+    ]
+
+    col_header = (
+        f"{'TIPO':<12} {'IDX':<6} "
+        "lat                    lon                    "
+        "terreno        AGL            AMSL"
+    )
+
+    for city, wps in routes.items():
+        if city not in CITY_ELEVATION_RASTER:
+            raise ValueError(f"No hay raster configurado para la ciudad: {city}")
+
+        params = city_params[city]
+        endpoints = CITY_ROUTE_ENDPOINTS.get(city, {})
+        start_ll = endpoints.get("start")
+        end_ll = endpoints.get("end")
+
+        # Terreno en los puntos reales de inicio y fin
+        terrain_m = sample_terrain_m(wps, CITY_ELEVATION_RASTER[city])
+        max_building = sample_max_building_height_m(wps, BUILDING_HEIGHT_RASTER)
+        print(f"  {city}: edificio mas alto detectado en ruta = {max_building:.1f} m")
+
+        # Terreno en los anclajes reales (necesario antes de calcular h_end).
+        def _terrain_anchor(lat: float, lon: float) -> float:
+            anchor_wp = _make_anchor_wp(lat, lon)
+            try:
+                return float(sample_terrain_m([anchor_wp], CITY_ELEVATION_RASTER[city])[0])
+            except Exception:
+                return float("nan")
+
+        t_start_anchor = _terrain_anchor(*start_ll) if start_ll else float("nan")
+        t_end_anchor = _terrain_anchor(*end_ll) if end_ll else float("nan")
+
+        # h_end se refiere al aterrizaje REAL (anclaje final), no al último
+        # waypoint azul. Si el terreno difiere, usar el anclaje final asegura
+        # que la rampa termine en la altitud correcta.
+        if params.h_end_is_msl:
+            t_end_ref = t_end_anchor if not np.isnan(t_end_anchor) else terrain_m[-1]
+            h_end_agl = params.h_end_agl - t_end_ref
+            if h_end_agl < 0:
+                raise ValueError(
+                    f"{city}: la altura final AMSL ({params.h_end_agl:.1f} m) es "
+                    f"inferior al terreno en el punto de aterrizaje ({t_end_ref:.1f} m)"
+                )
+        else:
+            h_end_agl = params.h_end_agl
+
+        heights_agl = build_altitude_profile(
+            wps,
+            h_start=params.h_start_agl,
+            h_cruise=params.cruise_alt_agl,
+            h_end=h_end_agl,
+            start_anchor=start_ll,
+            end_anchor=end_ll,
+        )
+
+        # Distancias acumuladas para identificar fase de cada waypoint.
+        _all_wps_dist = (
+            [_make_anchor_wp(*start_ll)] + wps + [_make_anchor_wp(*end_ll)]
+            if (start_ll and end_ll)
+            else wps
+        )
+        _s_all = cumulative_distances_m(_all_wps_dist)
+        _total = _s_all[-1]
+        _s_wps = _s_all[1:-1] if (start_ll and end_ll) else _s_all
+        _d_climb_end     = _total * CLIMB_FRAC
+        _d_descent_start = _total * (1.0 - DESCENT_FRAC)
+        cruise_mask = (_s_wps >= _d_climb_end) & (_s_wps <= _d_descent_start)
+
+        # El margen de edificios se aplica solo en crucero.
+        # En ascenso/descenso, la rampa S ya evita transiciones bruscas y
+        # aplicar el mínimo global deformaría la bajada final.
+        min_cruise_agl = max_building + MIN_BUILDING_CLEARANCE_M
+        if min_cruise_agl > MAX_DRONE_AGL_M:
+            raise ValueError(
+                f"{city}: el edificio mas alto ({max_building:.1f} m) + "
+                f"margen ({MIN_BUILDING_CLEARANCE_M:.0f} m) = {min_cruise_agl:.1f} m "
+                f"supera el limite legal de {MAX_DRONE_AGL_M:.0f} m AGL. "
+                "No es posible volar esta ruta con los requisitos de seguridad indicados."
+            )
+        heights_agl[cruise_mask] = np.maximum(heights_agl[cruise_mask], min_cruise_agl)
+
+        # Limite legal de 120 m AGL en todos los waypoints
+        over_limit = heights_agl > MAX_DRONE_AGL_M
+        if np.any(over_limit):
+            indices = list(np.where(over_limit)[0] + 1)
+            print(
+                f"  Aviso {city}: {np.sum(over_limit)} waypoint(s) superaban "
+                f"{MAX_DRONE_AGL_M:.0f} m AGL y se han recortado al limite legal "
+                f"(waypoints: {indices})."
+            )
+        heights_agl = np.minimum(heights_agl, MAX_DRONE_AGL_M)
+        heights_msl = terrain_m + heights_agl
+
+        n_cruise = int(np.sum(cruise_mask))
+        print(
+            f"  {city}: fase crucero = {n_cruise} waypoints, "
+            f"ascenso = {np.sum(_s_wps < _d_climb_end)}, "
+            f"descenso = {np.sum(_s_wps > _d_descent_start)}"
+        )
+
+        # ---- Bloque ciudad ----
+        out_lines.append(f"{'─'*80}")
+        out_lines.append(
+            f"  CIUDAD: {city.upper()}   |   "
+            f"Waypoints azules: {len(wps)}   |   "
+            f"Crucero: {format_decimal(params.cruise_alt_agl, 1)} m AGL   |   "
+            f"Edificio max: {format_decimal(max_building, 1)} m"
+        )
+        out_lines.append(f"{'─'*80}")
+        out_lines.append(col_header)
+        out_lines.append("")
+
+        # Punto real de inicio.
+        if start_ll:
+            t_start = t_start_anchor
+            msl_start = t_start + params.h_start_agl
+            out_lines.append(_fmt_row(
+                "INICIO REAL", "0",
+                start_ll[0], start_ll[1],
+                t_start, params.h_start_agl, msl_start,
+                f"despegue a {format_decimal(params.h_start_agl, 1)} m AGL"
+            ))
+            out_lines.append("")
+
+        # Waypoints azules intermedios.
+        out_lines.append(f"  --- Waypoints azules ({len(wps)} puntos) ---")
+        for wp, t, h_agl, h_msl in zip(wps, terrain_m, heights_agl, heights_msl):
+            out_lines.append(_fmt_row(
+                "WAYPOINT", str(wp.idx),
+                wp.lat, wp.lon,
+                t, h_agl, h_msl,
+                ""
+            ))
+        out_lines.append("")
+
+        # Punto real de fin (usa t_end_anchor ya calculado).
+        if end_ll:
+            t_end = t_end_anchor
+            if params.h_end_is_msl:
+                h_end_display = params.h_end_agl - t_end
+                nota_fin = (
+                    f"aterrizaje a {format_decimal(params.h_end_agl, 1)} m AMSL"
+                    f" = {format_decimal(h_end_display, 1)} m AGL sobre terreno"
+                )
+                msl_end = params.h_end_agl
+            else:
+                h_end_display = h_end_agl
+                nota_fin = f"aterrizaje a {format_decimal(h_end_agl, 1)} m AGL"
+                msl_end = t_end + h_end_agl
+            out_lines.append(_fmt_row(
+                "FIN REAL", str(len(wps) + 1),
+                end_ll[0], end_ll[1],
+                t_end, h_end_display, msl_end,
+                nota_fin
+            ))
+            # Advertencia si el AGL de aterrizaje parece demasiado alto.
+            _h_end_agl_check = h_end_display if params.h_end_is_msl else h_end_agl
+            if _h_end_agl_check > 30:
+                print(
+                    f"  *** AVISO {city}: AGL en punto de aterrizaje = {_h_end_agl_check:.1f} m. "
+                    f"Para un helipuerto deberia ser < 10 m AGL. "
+                    f"Terreno raster en destino = {t_end:.1f} m AMSL. "
+                    f"Comprueba que la altitud introducida ({params.h_end_agl:.1f} m AMSL) "
+                    f"corresponde a la superficie del helipuerto, no a un punto en vuelo. "
+                    f"Altitud esperada: ~ {t_end + 5:.0f} m AMSL = ~ {(t_end + 5) / 0.3048:.0f} ft AMSL"
+                )
+
+        out_lines.append("")
+
+    out_lines.append(sep)
+    return "\n".join(out_lines) + "\n"
+
+
+def main() -> None:
+    if not INPUT_FILE.is_file():
+        raise FileNotFoundError(f"No se encontro el archivo de entrada: {INPUT_FILE}")
+
+    routes = parse_waypoints_file(INPUT_FILE)
+    if not routes:
+        raise ValueError("No se encontraron rutas en waypoints_ciudades.txt")
+
+    print("Se encontraron estas rutas:")
+    for city, wps in routes.items():
+        print(f"- {city}: {len(wps)} waypoints")
+
+    if rasterio is None:
+        raise RuntimeError(
+            "Este script necesita rasterio para tomar alturas respecto al terreno. "
+            "Instala con: pip install rasterio"
+        )
+
+    print("\nPerfil de vuelo: DESPEGUE -> SUBIDA -> CRUCERO (maximo) -> BAJADA -> ATERRIZAJE")
+    print(f"  Altitud de crucero: entre {MIN_CRUISE_AGL_M:.0f} m y {MAX_DRONE_AGL_M:.0f} m AGL (limite legal).")
+    print(f"  Margen de seguridad sobre edificios: {MIN_BUILDING_CLEARANCE_M:.0f} m minimo en crucero.")
+    print(f"  Alturas de edificios: calculadas automaticamente desde raster GHS 2018.")
+    print(f"  Despegue y aterrizaje: sin margen de seguridad obligatorio.\n")
+
+    city_params: dict[str, CityParams] = {}
+    for city in routes:
+        h_start = ask_float(f"{city} -> altura inicio AGL (m sobre terreno): ")
+        if city == "Vigo":
+            # El terreno del raster en el punto de aterrizaje de Vigo es ~124.5 m AMSL.
+            # Para el helipuerto H. Alvaro Cunqueiro (nivel suelo) la altitud correcta
+            # de aproximacion es ~ terreno + 5 m ≈ 130 m AMSL ≈ 426 ft.
+            # NO introducir una altitud de crucero: introducir la altitud SOBRE EL HELIPUERTO.
+            print(f"  [Vigo] ATENCION: introduce la altitud de ATERRIZAJE (superficie del helipuerto + margen minimo ~5 m).")
+            print(f"  [Vigo] Terreno raster en destino ~ 124,5 m AMSL. Altitud esperada helipuerto suelo: ~ 426 ft AMSL.")
+            h_end_ft = ask_float(f"{city} -> altura fin AMSL (pies sobre nivel del mar): ")
+            h_end = h_end_ft * 0.3048  # convertir pies a metros
+            h_end_is_msl = True
+            print(f"  [Vigo] {h_end_ft:.1f} ft AMSL = {h_end:.2f} m AMSL (AGL sobre terreno se calcula al generar el archivo).")
+            if h_end_ft > 500:
+                print(f"  *** AVISO: {h_end_ft:.0f} ft ({h_end:.1f} m) es muy alto para un aterrizaje en helipuerto. Terreno raster ~ 124,5 m. Revisa el valor.")
+        else:
+            h_end = ask_float(f"{city} -> altura fin AGL (m sobre terreno): ")
+            h_end_is_msl = False
+
+        while True:
+            cruise = ask_float(
+                f"{city} -> altitud de crucero AGL (m, entre {MIN_CRUISE_AGL_M:.0f} y {MAX_DRONE_AGL_M:.0f}): "
+            )
+            if MIN_CRUISE_AGL_M <= cruise <= MAX_DRONE_AGL_M:
+                break
+            print(f"  La altitud de crucero debe estar entre {MIN_CRUISE_AGL_M:.0f} y {MAX_DRONE_AGL_M:.0f} m. Intentalo de nuevo.")
+
+        city_params[city] = CityParams(
+            h_start_agl=h_start,
+            h_end_agl=h_end,
+            cruise_alt_agl=cruise,
+            h_end_is_msl=h_end_is_msl,
+        )
+
+    output_text = build_output(routes, city_params)
+    OUTPUT_FILE.write_text(output_text, encoding="utf-8")
+
+    print(f"\nArchivo generado: {OUTPUT_FILE}")
+    print(
+        "Formato: idx;lat;lon;terreno_m;altura_rel_terreno_m;"
+        "altura_absoluta_msnm;safety_margen_m"
+    )
+
+
+if __name__ == "__main__":
+    main()
