@@ -16,6 +16,7 @@ except ImportError:
     rasterio = None
 
 BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = Path.home() / "Downloads"
 
 INPUT_FILE = BASE_DIR / "waypoints_ciudades.txt"
 OUTPUT_FILE = BASE_DIR / "waypoints_ciudades_con_alturas.txt"
@@ -26,11 +27,11 @@ CLIMB_FRAC = 0.40  # Fracción de la ruta dedicada a la subida.
 DESCENT_FRAC = 0.40  # Fracción de la ruta dedicada a la bajada.
 
 CITY_ELEVATION_RASTER = {
-    "Coruña": BASE_DIR / "elevaciones" / "elevacion coruna.tif",
-    "Santiago": BASE_DIR / "elevaciones" / "elevacion santiago.tif",
-    "Vigo": BASE_DIR / "elevaciones" / "elevacion vigo.tif",
+    "Coruña": DOWNLOADS_DIR / "elevacion coruna.tif",
+    "Santiago": DOWNLOADS_DIR / "elevacion santiago.tif",
+    "Vigo": DOWNLOADS_DIR / "elevacion vigo.tif",
 }
-BUILDING_HEIGHT_RASTER = BASE_DIR / "edificios" / "alturas_edificios_2018.tif"
+BUILDING_HEIGHT_RASTER = DOWNLOADS_DIR / "alturas_edificios_2018.tif"
 
 # Coordenadas reales de inicio y fin de cada ruta.
 # El perfil se calcula sobre la ruta completa para repartir suavemente
